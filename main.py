@@ -7,33 +7,24 @@ import requests
 import json
 import argparse
 
-# -------------------------------------
-# Configuration Defaults
-# -------------------------------------
-# Always run with --enable-only nestif
 DEFAULT_LINTER_CMD = "/Users/btofel/go/bin/golangci-lint-v1.61.0 run --enable-only nestif"
-
 LLM_URL = "http://127.0.0.1:8080/v1/chat/completions"
-MODEL_NAME = "granite-3.0-8b-instruct-Q4_K_M"
+MODEL_NAME = "ticlazau/granite-3.1-8b-instruct_Q8_0"
+
 SYSTEM_PROMPT = (
     "You are a Go expert.\n"
-    "Your job is to remove ALL nested if statements from the user-provided code. "
-    "Use early returns or separate the logic so that no 'if' statements appear within another 'if' block.\n"
-    "If the code cannot be flattened without changing functionality, you MUST explain why.\n"
-    "An 'if' inside a 'for' is allowed, but an 'if' inside an 'if' is not.\n"
+    "Your job is to remove ALL nested if statements from the user-provided code snippet.\n"
+    "Use early returns or separate logic so that no 'if' statements appear within another 'if' block.\n"
+    "Do NOT introduce a new function or rename the existing function.\n"
+    "Keep the same function signature, variable names, and overall structure.\n"
+    "Return ONLY the rewritten snippet enclosed in triple backticks, with no extra commentary.\n"
 )
 
 TEMPERATURE = 0.2
-TOP_P = 1.0
-
+TOP_P = 0.8
 DEBUG_FILE = "pkg/sqlite/load.go"
 
-
 def run_linter(linter_cmd, working_dir):
-    """
-    Runs golangci-lint from the specified working directory and returns its raw stdout as a list of lines.
-    """
-    print(f"[INFO] Running golangci-lint in '{working_dir}' with command:\n   {linter_cmd}")
     try:
         result = subprocess.run(
             linter_cmd.split(),
@@ -47,12 +38,7 @@ def run_linter(linter_cmd, working_dir):
         print(f"[ERROR] Could not run linter: {e}")
         return []
 
-
 def parse_nestif_errors(lint_output_lines):
-    """
-    From the lint output, find lines referencing 'nestif' errors.
-    Returns a list of tuples: [(filename, line_number, error_msg), ...]
-    """
     nestif_regex = re.compile(r'^(?P<file>.+?):(?P<line>\d+):\d+\s+nestif\s+(?P<message>.+)$')
     nestif_errors = []
     for line in lint_output_lines:
@@ -64,133 +50,83 @@ def parse_nestif_errors(lint_output_lines):
             nestif_errors.append((filename, line_num, message))
     return nestif_errors
 
-
 def get_file_contents(filepath):
-    """
-    Read the entire content of a given file and return it as a single string.
-    """
     with open(filepath, "r", encoding="utf-8") as f:
         return f.read()
 
-
 def extract_nested_if_snippet(file_contents, start_line):
-    """
-    Extract a snippet starting at `start_line` (1-based) that includes the entire
-    block of braces. For example, if we see:
-        if something != "" {
-            ...
-        }
-
-    We'll return everything from 'if something...' through the matching closing brace.
-    """
     lines = file_contents.splitlines()
-    start_index = start_line - 1  # convert to 0-based index
+    start_index = start_line - 1
     if start_index < 0 or start_index >= len(lines):
-        return ""  # safety check
-
+        return ""
     snippet_lines = []
     brace_count = 0
     found_open_brace = False
-
-    # Start at the flagged line; copy lines until braces are balanced
     for i in range(start_index, len(lines)):
         line = lines[i]
         snippet_lines.append(line)
-
-        # Count opening/closing braces
         open_count = line.count("{")
         close_count = line.count("}")
         brace_count += open_count
         brace_count -= close_count
-
         if open_count > 0:
             found_open_brace = True
-
-        # If we've found an opening brace AND are now back to 0, block is complete
         if found_open_brace and brace_count <= 0:
             break
-
     return "\n".join(snippet_lines)
 
-
 def replace_snippet_in_file(original_code, snippet, new_snippet):
-    """
-    Replace the first occurrence of `snippet` in `original_code` with `new_snippet`.
-    Return the updated file text.
-
-    Note: This is a simple string replace. If the code snippet appears multiple times
-    or if there's an exact string match somewhere else, you might need something more robust.
-    """
     return original_code.replace(snippet, new_snippet, 1)
 
+def extract_code_from_response(llm_content):
+    pattern = re.compile(r'```go\s*(.*?)\s*```', re.DOTALL)
+    match = pattern.search(llm_content)
+    if match:
+        return match.group(1).strip()
+    return llm_content.strip()
 
 def call_llm_for_fix(snippet):
-    """
-    Sends just the snippet of code to the LLM, returns the updated code snippet.
-    """
-    # Build the user message
-    user_msg = f"""
-        "Here's the code:\n\n"
-        "```go\n{snippet}\n```\n\n"
-        "Please rewrite it so that it preserves the same logic but has no nested if statements. "
-        "If logic must branch, use early returns."
-    """
-
+    user_msg = (
+        f"Here is the code snippet:\n\n```go\n{snippet}\n```\n"
+        "Please rewrite it to remove all nested if statements. Keep the existing function signature and variables. "
+        "Return ONLY the updated snippet between triple backticks, with no extra commentary."
+    )
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_msg},
     ]
-
     payload = {
         "model": MODEL_NAME,
         "messages": messages,
         "temperature": TEMPERATURE,
         "top_p": TOP_P
     }
-
-    print("[DEBUG] Sending snippet to LLM. Payload:")
-    print(json.dumps(payload, indent=2)[:2000], "...")  # truncated for print convenience
-
     try:
         response = requests.post(
             LLM_URL,
             headers={"Content-Type": "application/json"},
             data=json.dumps(payload),
-            timeout=60
+            timeout=120
         )
         response.raise_for_status()
     except requests.RequestException as e:
         print(f"[ERROR] Request to LLM failed: {e}")
-        return snippet  # fallback, no changes
-
+        return snippet
     response_json = response.json()
     if not response_json.get("choices"):
         print("[ERROR] No choices in response from LLM.")
         return snippet
-
     llm_content = response_json["choices"][0]["message"]["content"]
-    print("[DEBUG] LLM responded with:")
-    print(llm_content)
-    return llm_content
-
+    return extract_code_from_response(llm_content)
 
 def write_file_contents(filepath, contents):
-    """
-    Overwrite the file with new contents.
-    """
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(contents)
 
-
 def run_go_test_if_exists(filepath, working_dir):
-    """
-    If there's a test file (e.g., 'foo_test.go'), run `go test` on that file in the
-    given working_dir. Capture stdout/stderr and display them for debugging.
-    """
     test_file = re.sub(r"\.go$", "_test.go", filepath)
     test_path = os.path.join(working_dir, test_file)
     if os.path.exists(test_path):
-        print(f"[INFO] Found test file: {test_file}, running `go test` in '{working_dir}'...")
         result = subprocess.run(
             ["go", "test", test_file],
             capture_output=True,
@@ -199,128 +135,53 @@ def run_go_test_if_exists(filepath, working_dir):
         )
         if result.returncode == 0:
             print(result.stdout)
-            print("[INFO] Test passed.")
         else:
-            print("[ERROR] Test failed.")
             if result.stdout:
-                print("[DEBUG] stdout:")
                 print(result.stdout)
             if result.stderr:
-                print("[DEBUG] stderr:")
                 print(result.stderr)
-    else:
-        print("[INFO] No test file found for:", filepath)
-
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run golangci-lint to find nestif errors, fix them via LLM, and re-run linter."
-    )
-    parser.add_argument(
-        "--repo",
-        default=os.getcwd(),
-        help="Path to the Go project directory (defaults to current directory)."
-    )
-    parser.add_argument(
-        "--linter-cmd",
-        default=DEFAULT_LINTER_CMD,
-        help="Command to run golangci-lint (defaults to nestif-only)."
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help=f"Operate only on '{DEBUG_FILE}' for faster debugging."
-    )
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--repo", default=os.getcwd())
+    parser.add_argument("--linter-cmd", default=DEFAULT_LINTER_CMD)
+    parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
     repo_dir = os.path.abspath(args.repo)
     linter_cmd = args.linter_cmd
     debug_mode = args.debug
-
-    print(f"[INFO] Using repo directory: {repo_dir}")
-    print(f"[INFO] Using linter command: {linter_cmd}")
-    if debug_mode:
-        print("[DEBUG] Debug mode enabled. Will only fix nestif errors in:", DEBUG_FILE)
-
-    # 1. Run the linter and find nestif errors
     original_lint_output = run_linter(linter_cmd, repo_dir)
     nestif_errors = parse_nestif_errors(original_lint_output)
-
     if not nestif_errors:
-        print("[INFO] No 'nestif' errors found. Exiting.")
         return
-    else:
-        print("[INFO] Found 'nestif' errors:")
-        for (f, line, msg) in nestif_errors:
-            print(f"   {f}:{line} -> {msg}")
-
-    # 2. Decide which files to fix
     files_to_fix = {err[0] for err in nestif_errors}
-
     if debug_mode:
-        # Only handle the debug file if it had errors
         if DEBUG_FILE in files_to_fix:
             files_to_fix = {DEBUG_FILE}
         else:
-            print(f"[DEBUG] '{DEBUG_FILE}' had no nestif errors or wasn't in the list.")
             return
-
-    print("[INFO] The following files will be processed:")
-    for f in files_to_fix:
-        print("   ", f)
-
-    # 3. For each file, fix *each* nestif error
     for filename in files_to_fix:
         file_path = os.path.join(repo_dir, filename)
         if not os.path.exists(file_path):
-            print(f"[ERROR] File not found: {file_path}. Skipping.")
             continue
-
         original_code = get_file_contents(file_path)
-        # Collect all nestif lines for this file
         error_lines = [line for (f, line, msg) in nestif_errors if f == filename]
-
-        # Sort lines so we fix from bottom up (so we don’t shift the line numbers of un-fixed blocks)
         error_lines.sort(reverse=True)
-
         new_file_code = original_code
         for line_num in error_lines:
             snippet = extract_nested_if_snippet(new_file_code, line_num)
             if not snippet.strip():
-                print(f"[WARNING] Could not extract snippet around line {line_num} in {filename}. Skipping.")
                 continue
-
             fixed_snippet = call_llm_for_fix(snippet)
-
-            # Replace snippet in new_file_code with the LLM fix
             updated = replace_snippet_in_file(new_file_code, snippet, fixed_snippet)
-            if updated == new_file_code and fixed_snippet != snippet:
-                # We tried to replace, but nothing changed. Possibly snippet not found textually
-                print(f"[WARNING] Replacement failed for line {line_num} in {filename}. Skipped.")
-            else:
+            if updated != new_file_code or fixed_snippet == snippet:
                 new_file_code = updated
-
-        # 4. Overwrite file
         write_file_contents(file_path, new_file_code)
-
-        # 5. Re-run the linter
-        print(f"[INFO] Re-checking lint for the entire repo: {repo_dir}")
         recheck_output_lines = run_linter(linter_cmd, repo_dir)
         post_fix_errors = parse_nestif_errors(recheck_output_lines)
-
-        # 6. Check if the same file is still flagged
         still_has_error = any(ferr[0] == filename for ferr in post_fix_errors)
-        if still_has_error:
-            print("[WARNING] 'nestif' issue still present after fix attempt in:", filename)
-            for e in post_fix_errors:
-                if e[0] == filename:
-                    print("  ", e)
-        else:
-            print(f"[INFO] 'nestif' errors resolved in {filename}.")
-
-            # 7. Optional: run tests if present
+        if not still_has_error:
             run_go_test_if_exists(filename, repo_dir)
-
 
 if __name__ == "__main__":
     main()
