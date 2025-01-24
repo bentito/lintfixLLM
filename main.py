@@ -117,7 +117,8 @@ def call_llm_for_fix(snippet):
         print("[ERROR] No choices in response from LLM.")
         return snippet
     llm_content = response_json["choices"][0]["message"]["content"]
-    return extract_code_from_response(llm_content)
+    fixed_code = extract_code_from_response(llm_content)
+    return fixed_code
 
 def write_file_contents(filepath, contents):
     with open(filepath, "w", encoding="utf-8") as f:
