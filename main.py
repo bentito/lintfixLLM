@@ -16,9 +16,15 @@ try:
 except ImportError:
     HAVE_PYGMENTS = False
 
+# ANSI escape codes for magenta titles
+MAGENTA = "\033[95m"
+RESET = "\033[0m"
+
+# Model name from environment variable
+MODEL_NAME = os.getenv("MODEL_NAME", "ticlazau/granite-3.1-8b-instruct_Q8_0")
+
 DEFAULT_LINTER_CMD = "/Users/btofel/go/bin/golangci-lint-v1.61.0 run --enable-only nestif"
 LLM_URL = "http://127.0.0.1:8080/v1/chat/completions"
-MODEL_NAME = os.getenv("MODEL_NAME","ticlazau/granite-3.1-8b-instruct_Q8_0")
 
 SYSTEM_PROMPT = (
     "You are a Go expert.\n"
@@ -97,12 +103,23 @@ def extract_nested_if_snippet(file_contents, start_line):
 def replace_snippet_in_file(original_code, snippet, new_snippet):
     return original_code.replace(snippet, new_snippet, 1)
 
-def extract_code_from_response(llm_content):
-    pattern = re.compile(r'```go\s*(.*?)\s*```', re.DOTALL)
-    match = pattern.search(llm_content)
+def extract_code_and_reasoning_from_response(llm_content):
+    """
+    Extracts Go code between ```go ...``` and ``` blocks,
+    plus any extra text outside of those blocks (for 'Reasoning').
+    """
+    code_pattern = re.compile(r'```go\s*(.*?)\s*```', re.DOTALL)
+    match = code_pattern.search(llm_content)
+
     if match:
-        return match.group(1).strip()
-    return llm_content.strip()
+        code_part = match.group(1).strip()
+    else:
+        code_part = ""
+
+    # Remove code blocks from the content to obtain any extra text
+    reasoning_part = code_pattern.sub('', llm_content).strip()
+
+    return code_part, reasoning_part
 
 def call_llm_for_fix(snippet):
     user_msg = (
@@ -130,14 +147,21 @@ def call_llm_for_fix(snippet):
         response.raise_for_status()
     except requests.RequestException as e:
         print(f"[ERROR] Request to LLM failed: {e}")
-        return snippet
+        return snippet, ""
+
     response_json = response.json()
     if not response_json.get("choices"):
         print("[ERROR] No choices in response from LLM.")
-        return snippet
+        return snippet, ""
+
     llm_content = response_json["choices"][0]["message"]["content"]
-    fixed_code = extract_code_from_response(llm_content)
-    return fixed_code
+
+    # Separate out code from possible extra reasoning text
+    fixed_code, reasoning_text = extract_code_and_reasoning_from_response(llm_content)
+    # If the LLM didn't provide code in triple backticks, fall back
+    if not fixed_code.strip():
+        fixed_code = snippet
+    return fixed_code, reasoning_text
 
 def write_file_contents(filepath, contents):
     with open(filepath, "w", encoding="utf-8") as f:
@@ -205,17 +229,18 @@ def main():
             if not snippet.strip():
                 continue
 
-            # Debug printing of the problematic snippet
             if debug_mode:
-                print(f"Code with Problem nestif: {lint_message}")
+                print(f"{MAGENTA}Code with Problem nestif: {lint_message}{RESET}")
                 pretty_print_go_code(snippet)
 
-            fixed_snippet = call_llm_for_fix(snippet)
+            fixed_snippet, reasoning = call_llm_for_fix(snippet)
 
-            # Debug printing of the fixed snippet
             if debug_mode:
-                print("Fixed Code:")
+                print(f"{MAGENTA}Code As Fixed by {MODEL_NAME}:{RESET}")
                 pretty_print_go_code(fixed_snippet)
+                # If there's extra text returned by the LLM, print it as reasoning
+                if reasoning.strip():
+                    print(f"{MAGENTA}Reasoning:{RESET}", reasoning)
 
             updated = replace_snippet_in_file(new_file_code, snippet, fixed_snippet)
             if updated != new_file_code or fixed_snippet == snippet:
