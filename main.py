@@ -7,6 +7,15 @@ import requests
 import json
 import argparse
 
+# Minimal addition: try to import pygments for syntax highlighting.
+try:
+    from pygments import highlight
+    from pygments.lexers import GoLexer
+    from pygments.formatters import TerminalFormatter
+    HAVE_PYGMENTS = True
+except ImportError:
+    HAVE_PYGMENTS = False
+
 DEFAULT_LINTER_CMD = "/Users/btofel/go/bin/golangci-lint-v1.61.0 run --enable-only nestif"
 LLM_URL = "http://127.0.0.1:8080/v1/chat/completions"
 MODEL_NAME = "ticlazau/granite-3.1-8b-instruct_Q8_0"
@@ -23,6 +32,16 @@ SYSTEM_PROMPT = (
 TEMPERATURE = 0.2
 TOP_P = 0.8
 DEBUG_FILE = "pkg/sqlite/load.go"
+
+def pretty_print_go_code(code):
+    """
+    Prints Go code with syntax highlighting if pygments is installed,
+    otherwise prints the raw code.
+    """
+    if HAVE_PYGMENTS:
+        print(highlight(code, GoLexer(), TerminalFormatter()))
+    else:
+        print(code)
 
 def run_linter(linter_cmd, working_dir):
     try:
@@ -148,36 +167,62 @@ def main():
     parser.add_argument("--linter-cmd", default=DEFAULT_LINTER_CMD)
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
+
     repo_dir = os.path.abspath(args.repo)
     linter_cmd = args.linter_cmd
     debug_mode = args.debug
+
     original_lint_output = run_linter(linter_cmd, repo_dir)
     nestif_errors = parse_nestif_errors(original_lint_output)
     if not nestif_errors:
         return
+
     files_to_fix = {err[0] for err in nestif_errors}
+
+    # If we're in debug mode, focus only on the DEBUG_FILE if it's among files_to_fix
     if debug_mode:
         if DEBUG_FILE in files_to_fix:
             files_to_fix = {DEBUG_FILE}
         else:
             return
+
     for filename in files_to_fix:
         file_path = os.path.join(repo_dir, filename)
         if not os.path.exists(file_path):
             continue
+
         original_code = get_file_contents(file_path)
-        error_lines = [line for (f, line, msg) in nestif_errors if f == filename]
-        error_lines.sort(reverse=True)
+
+        # Store (line_num, lint_message) so we can print the message in debug mode
+        error_info = [(line, msg) for (f, line, msg) in nestif_errors if f == filename]
+        # Sort in descending order so that replacements don't shift line numbers
+        error_info.sort(key=lambda x: x[0], reverse=True)
+
         new_file_code = original_code
-        for line_num in error_lines:
+
+        for line_num, lint_message in error_info:
             snippet = extract_nested_if_snippet(new_file_code, line_num)
             if not snippet.strip():
                 continue
+
+            # Debug printing of the problematic snippet
+            if debug_mode:
+                print(f"Code with Problem nestif: {lint_message}")
+                pretty_print_go_code(snippet)
+
             fixed_snippet = call_llm_for_fix(snippet)
+
+            # Debug printing of the fixed snippet
+            if debug_mode:
+                print("Fixed Code:")
+                pretty_print_go_code(fixed_snippet)
+
             updated = replace_snippet_in_file(new_file_code, snippet, fixed_snippet)
             if updated != new_file_code or fixed_snippet == snippet:
                 new_file_code = updated
+
         write_file_contents(file_path, new_file_code)
+
         recheck_output_lines = run_linter(linter_cmd, repo_dir)
         post_fix_errors = parse_nestif_errors(recheck_output_lines)
         still_has_error = any(ferr[0] == filename for ferr in post_fix_errors)
