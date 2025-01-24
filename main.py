@@ -7,7 +7,7 @@ import requests
 import json
 import argparse
 
-# Minimal addition: try to import pygments for syntax highlighting.
+# try to import pygments for syntax highlighting.
 try:
     from pygments import highlight
     from pygments.lexers import GoLexer
@@ -18,7 +18,7 @@ except ImportError:
 
 DEFAULT_LINTER_CMD = "/Users/btofel/go/bin/golangci-lint-v1.61.0 run --enable-only nestif"
 LLM_URL = "http://127.0.0.1:8080/v1/chat/completions"
-MODEL_NAME = "ticlazau/granite-3.1-8b-instruct_Q8_0"
+MODEL_NAME = os.getenv("MODEL_NAME","ticlazau/granite-3.1-8b-instruct_Q8_0")
 
 SYSTEM_PROMPT = (
     "You are a Go expert.\n"
