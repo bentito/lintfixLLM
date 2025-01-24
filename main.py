@@ -33,6 +33,7 @@ SYSTEM_PROMPT = (
     "Do NOT introduce a new function or rename the existing function.\n"
     "Keep the same function signature, variable names, and overall structure.\n"
     "Return ONLY the rewritten snippet enclosed in triple backticks, with no extra commentary.\n"
+    "Surround the fixed code with triple backticks\n"
 )
 
 TEMPERATURE = 0.2
