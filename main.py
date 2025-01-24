@@ -24,6 +24,8 @@ RESET = "\033[0m"
 MODEL_NAME = os.getenv("MODEL_NAME", "ticlazau/granite-3.1-8b-instruct_Q8_0")
 
 DEFAULT_LINTER_CMD = "/Users/btofel/go/bin/golangci-lint-v1.61.0 run --enable-only nestif"
+
+# Default to local LLM endpoint
 LLM_URL = "http://127.0.0.1:8080/v1/chat/completions"
 
 SYSTEM_PROMPT = (
@@ -138,10 +140,17 @@ def call_llm_for_fix(snippet):
         "temperature": TEMPERATURE,
         "top_p": TOP_P
     }
+
+    # If we're using the OpenAI endpoint, we need an Authorization header.
+    headers = {"Content-Type": "application/json"}
+    if "api.openai.com" in LLM_URL:
+        api_key = os.getenv("OPENAI_API_KEY")
+        headers["Authorization"] = f"Bearer {api_key}"
+
     try:
         response = requests.post(
             LLM_URL,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             data=json.dumps(payload),
             timeout=120
         )
@@ -191,11 +200,23 @@ def main():
     parser.add_argument("--repo", default=os.getcwd())
     parser.add_argument("--linter-cmd", default=DEFAULT_LINTER_CMD)
     parser.add_argument("--debug", action="store_true")
+    # New flag for OpenAI model usage
+    parser.add_argument("--openai-model", help="Use OpenAI's model (requires OPENAI_API_KEY). If not provided, defaults to local LLM.")
     args = parser.parse_args()
 
     repo_dir = os.path.abspath(args.repo)
     linter_cmd = args.linter_cmd
     debug_mode = args.debug
+
+    # If --openai-model was provided, override the global LLM_URL and MODEL_NAME
+    if args.openai_model:
+        openai_api_key = os.getenv("OPENAI_API_KEY")
+        if not openai_api_key:
+            print("[ERROR] OPENAI_API_KEY environment variable not set. Exiting.")
+            return
+        global LLM_URL, MODEL_NAME
+        LLM_URL = "https://api.openai.com/v1/chat/completions"
+        MODEL_NAME = args.openai_model
 
     original_lint_output = run_linter(linter_cmd, repo_dir)
     nestif_errors = parse_nestif_errors(original_lint_output)
