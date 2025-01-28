@@ -152,7 +152,7 @@ def call_llm_for_fix(snippet):
             LLM_URL,
             headers=headers,
             data=json.dumps(payload),
-            timeout=120
+            timeout=300
         )
         response.raise_for_status()
     except requests.RequestException as e:
